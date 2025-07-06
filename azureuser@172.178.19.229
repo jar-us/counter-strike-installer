@@ -1,0 +1,275 @@
+#!/bin/bash
+# ==============================================================================
+# FIXED Counter-Strike 1.6 HLDS Installation Script
+# ==============================================================================
+
+# Stop on any error and enable debugging
+set -e
+set -x
+
+# --- Define Global Paths ---
+SERVER_DIR="/opt/hlds"
+STEAM_DIR="/opt/steamcmd"
+GAME_USER="azureuser"
+GAME_USER_HOME="/home/$GAME_USER"
+
+# --- Logging function ---
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/hlds_install.log
+}
+
+log "Starting Counter-Strike 1.6 HLDS installation..."
+
+# --- PART 1: SYSTEM PREPARATION ---
+log "Preparing system and installing dependencies..."
+export DEBIAN_FRONTEND=noninteractive
+
+# Update system
+sudo apt-get update -y
+sudo apt-get upgrade -y
+
+# Install all required dependencies including 32-bit libraries
+sudo apt-get install -y \
+    wget \
+    screen \
+    curl \
+    unzip \
+    lib32gcc-s1 \
+    lib32stdc++6 \
+    libc6-i386 \
+    lib32z1 \
+    lib32ncurses6 \
+    lib32tinfo6 \
+    steamcmd
+
+log "Dependencies installed successfully"
+
+# --- PART 2: CREATE DIRECTORIES AND SET PERMISSIONS ---
+log "Creating directories and setting ownership..."
+sudo mkdir -p "$STEAM_DIR"
+sudo mkdir -p "$SERVER_DIR"
+sudo mkdir -p "$GAME_USER_HOME/.steam/sdk32"
+sudo mkdir -p "$GAME_USER_HOME/.steam/sdk64"
+
+# Set proper ownership
+sudo chown -R "$GAME_USER:$GAME_USER" "$STEAM_DIR"
+sudo chown -R "$GAME_USER:$GAME_USER" "$SERVER_DIR"
+sudo chown -R "$GAME_USER:$GAME_USER" "$GAME_USER_HOME/.steam"
+
+log "Directories created and permissions set"
+
+# --- PART 3: DOWNLOAD AND INSTALL STEAMCMD ---
+log "Downloading and installing SteamCMD as user: $GAME_USER"
+sudo -u "$GAME_USER" bash -c "
+    cd '$STEAM_DIR'
+    
+    # Download SteamCMD
+    if [ ! -f steamcmd_linux.tar.gz ]; then
+        wget -q https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz
+    fi
+    
+    # Extract SteamCMD
+    if [ ! -f steamcmd.sh ]; then
+        tar -xf steamcmd_linux.tar.gz
+    fi
+    
+    # Make steamcmd executable
+    chmod +x steamcmd.sh
+    
+    log 'SteamCMD downloaded and extracted'
+"
+
+# --- PART 4: DOWNLOAD CS 1.6 SERVER FILES ---
+log "Downloading Counter-Strike 1.6 server files..."
+sudo -u "$GAME_USER" bash -c "
+    cd '$STEAM_DIR'
+    
+    # Download CS 1.6 server files with retry logic
+    for attempt in 1 2 3; do
+        log 'Attempt $attempt: Downloading CS 1.6 server files...'
+        if ./steamcmd.sh +force_install_dir '$SERVER_DIR' +login anonymous +app_update 90 validate +quit; then
+            log 'CS 1.6 server files downloaded successfully'
+            break
+        else
+            log 'Download attempt $attempt failed, retrying...'
+            sleep 10
+        fi
+    done
+"
+
+# --- PART 5: FIX STEAMCLIENT.SO SYMLINKS ---
+log "Creating steamclient.so symlinks..."
+sudo -u "$GAME_USER" bash -c "
+    # Create proper symlinks for steamclient.so
+    if [ -f '$SERVER_DIR/steamclient.so' ]; then
+        ln -sf '$SERVER_DIR/steamclient.so' '$GAME_USER_HOME/.steam/sdk32/steamclient.so'
+        ln -sf '$SERVER_DIR/steamclient.so' '$GAME_USER_HOME/.steam/sdk64/steamclient.so'
+        log 'Steamclient.so symlinks created'
+    else
+        log 'Warning: steamclient.so not found in server directory'
+    fi
+"
+
+# --- PART 6: CREATE SERVER CONFIGURATION ---
+log "Creating server configuration..."
+sudo -u "$GAME_USER" bash -c "
+    # Create cstrike directory if it doesn't exist
+    mkdir -p '$SERVER_DIR/cstrike'
+    
+    # Create server.cfg
+    cat <<EOF > '$SERVER_DIR/cstrike/server.cfg'
+// Basic Server Configuration
+hostname \"Counter-Strike 1.6 Azure Server\"
+rcon_password \"cs16rcon123\"
+sv_password \"\"
+mp_timelimit 45
+mp_friendlyfire 0
+mp_freezetime 5
+mp_roundtime 3
+mp_maxrounds 30
+sv_maxrate 25000
+sv_minrate 5000
+fps_max 1000
+sys_ticrate 1000
+say \"Welcome to Counter-Strike 1.6 Server!\"
+exec listip.cfg
+exec banned.cfg
+EOF
+
+    # Create motd.txt
+    cat <<EOF > '$SERVER_DIR/cstrike/motd.txt'
+Welcome to Counter-Strike 1.6 Server
+Powered by Azure Cloud
+Have fun and play fair!
+EOF
+
+    # Create listip.cfg and banned.cfg
+    touch '$SERVER_DIR/cstrike/listip.cfg'
+    touch '$SERVER_DIR/cstrike/banned.cfg'
+    
+    log 'Server configuration files created'
+"
+
+# --- PART 7: CREATE LAUNCH SCRIPT ---
+log "Creating launch script..."
+sudo -u "$GAME_USER" bash -c "
+    cat <<'EOF' > '$GAME_USER_HOME/start_server.sh'
+#!/bin/bash
+echo \"Starting Counter-Strike 1.6 Server...\"
+cd '$SERVER_DIR'
+export LD_LIBRARY_PATH='$SERVER_DIR'
+./hlds_run -game cstrike +map de_dust2 +maxplayers 16 -port 27015 -insecure -nomaster
+EOF
+
+    chmod +x '$GAME_USER_HOME/start_server.sh'
+    
+    # Create screen-based launch script
+    cat <<'EOF' > '$GAME_USER_HOME/start_server_screen.sh'
+#!/bin/bash
+echo \"Starting Counter-Strike 1.6 Server in screen session...\"
+screen -dmS cs16server bash -c 'cd '$SERVER_DIR' && export LD_LIBRARY_PATH='$SERVER_DIR' && ./hlds_run -game cstrike +map de_dust2 +maxplayers 16 -port 27015 -insecure -nomaster'
+echo \"Server started in screen session 'cs16server'\"
+echo \"To attach to the server console: screen -r cs16server\"
+echo \"To detach from screen: Ctrl+A then D\"
+EOF
+
+    chmod +x '$GAME_USER_HOME/start_server_screen.sh'
+    
+    log 'Launch scripts created'
+"
+
+# --- PART 8: CREATE SYSTEMD SERVICE ---
+log "Creating systemd service..."
+sudo tee /etc/systemd/system/cs16server.service > /dev/null <<EOF
+[Unit]
+Description=Counter-Strike 1.6 Server
+After=network.target
+
+[Service]
+Type=simple
+User=$GAME_USER
+WorkingDirectory=$SERVER_DIR
+Environment=LD_LIBRARY_PATH=$SERVER_DIR
+ExecStart=$SERVER_DIR/hlds_run -game cstrike +map de_dust2 +maxplayers 16 -port 27015 -insecure -nomaster
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- PART 9: CONFIGURE FIREWALL ---
+log "Configuring firewall..."
+sudo ufw allow 27015/udp comment 'CS 1.6 Game Port'
+sudo ufw allow 27015/tcp comment 'CS 1.6 RCON Port'
+sudo ufw allow 22/tcp comment 'SSH'
+
+# --- PART 10: SET PROPER PERMISSIONS ---
+log "Setting final permissions..."
+sudo chown -R "$GAME_USER:$GAME_USER" "$SERVER_DIR"
+sudo chown -R "$GAME_USER:$GAME_USER" "$STEAM_DIR"
+sudo chmod +x "$SERVER_DIR/hlds_run"
+
+# --- PART 11: TEST INSTALLATION ---
+log "Testing installation..."
+if [ -f "$SERVER_DIR/hlds_run" ]; then
+    log "SUCCESS: hlds_run found"
+else
+    log "ERROR: hlds_run not found!"
+    exit 1
+fi
+
+if [ -f "$SERVER_DIR/cstrike/liblist.gam" ]; then
+    log "SUCCESS: Counter-Strike game files found"
+else
+    log "ERROR: Counter-Strike game files not found!"
+    exit 1
+fi
+
+# --- PART 12: FINAL SETUP ---
+log "Enabling and starting CS 1.6 server service..."
+sudo systemctl daemon-reload
+sudo systemctl enable cs16server.service
+
+# Start the server
+sudo systemctl start cs16server.service
+
+log "Installation complete!"
+log "Server status: $(sudo systemctl is-active cs16server.service)"
+
+# --- FINAL INSTRUCTIONS ---
+cat <<EOF
+
+======================================================
+Counter-Strike 1.6 Server Installation Complete!
+======================================================
+
+Server Details:
+- Installation Directory: $SERVER_DIR
+- Game Port: 27015 (UDP)
+- RCON Port: 27015 (TCP)
+- RCON Password: cs16rcon123
+
+Management Commands:
+- Start server: sudo systemctl start cs16server.service
+- Stop server: sudo systemctl stop cs16server.service
+- Restart server: sudo systemctl restart cs16server.service
+- Check status: sudo systemctl status cs16server.service
+- View logs: sudo journalctl -u cs16server.service -f
+
+Alternative launch methods:
+- Manual start: $GAME_USER_HOME/start_server.sh
+- Screen session: $GAME_USER_HOME/start_server_screen.sh
+
+Configuration files:
+- Server config: $SERVER_DIR/cstrike/server.cfg
+- MOTD: $SERVER_DIR/cstrike/motd.txt
+
+To connect to your server:
+- Add server in CS 1.6: [YOUR_SERVER_IP]:27015
+- Or use console: connect [YOUR_SERVER_IP]:27015
+
+======================================================
+EOF
+
+log "Installation script completed successfully!"
